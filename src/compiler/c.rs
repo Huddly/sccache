@@ -135,6 +135,7 @@ impl ParsedArguments {
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
+    has_local_dependency_file: bool,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -471,7 +472,7 @@ where
                 let mut preprocessor_cache_entry = PreprocessorCacheEntry::read(&buf)?;
                 let mut updated = false;
                 let hit = preprocessor_cache_entry
-                    .lookup_result_digest(preprocessor_cache_mode_config, &mut updated);
+                    .lookup_result(preprocessor_cache_mode_config, &mut updated);
 
                 let mut update_failed = false;
                 if updated {
@@ -489,32 +490,42 @@ where
                 }
 
                 if !update_failed {
-                    if let Some(key) = hit {
+                    if let Some((key, included_files)) = hit {
                         debug!("Preprocessor cache hit: {preprocessor_key}");
-                        // A compiler binary may be a symlink to another and
-                        // so has the same digest, but that means
-                        // the toolchain will not contain the correct path
-                        // to invoke the compiler! Add the compiler
-                        // executable path to try and prevent this
-                        let weak_toolchain_key = format!(
-                            "{}-{}",
-                            self.executable.to_string_lossy(),
-                            self.executable_digest
-                        );
-                        return Ok(HashResult {
-                            key,
-                            compilation: Box::new(CCompilation {
-                                parsed_args: self.parsed_args.clone(),
-                                is_locally_preprocessed: false,
-                                #[cfg(feature = "dist-client")]
-                                preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON.to_vec(),
-                                executable: self.executable.clone(),
-                                compiler: self.compiler.to_owned(),
-                                cwd: cwd.clone(),
-                                env_vars: env_vars.clone(),
-                            }),
-                            weak_toolchain_key,
-                        });
+                        let has_local_dependency_file = !storage.basedirs().is_empty()
+                            && write_dependency_file_from_manifest(
+                                &self.parsed_args,
+                                &cwd,
+                                &included_files,
+                            )?;
+                        if storage.basedirs().is_empty() || has_local_dependency_file {
+                            // A compiler binary may be a symlink to another and
+                            // so has the same digest, but that means
+                            // the toolchain will not contain the correct path
+                            // to invoke the compiler! Add the compiler
+                            // executable path to try and prevent this
+                            let weak_toolchain_key = format!(
+                                "{}-{}",
+                                self.executable.to_string_lossy(),
+                                self.executable_digest
+                            );
+                            return Ok(HashResult {
+                                key,
+                                compilation: Box::new(CCompilation {
+                                    parsed_args: self.parsed_args.clone(),
+                                    is_locally_preprocessed: false,
+                                    has_local_dependency_file,
+                                    #[cfg(feature = "dist-client")]
+                                    preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON
+                                        .to_vec(),
+                                    executable: self.executable.clone(),
+                                    compiler: self.compiler.to_owned(),
+                                    cwd: cwd.clone(),
+                                    env_vars: env_vars.clone(),
+                                }),
+                                weak_toolchain_key,
+                            });
+                        }
                     } else {
                         debug!("Preprocessor cache miss: {preprocessor_key}");
                     }
@@ -662,6 +673,7 @@ where
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
+                has_local_dependency_file: true,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -687,6 +699,83 @@ where
 
     fn language(&self) -> Language {
         self.parsed_args.language
+    }
+}
+
+fn write_dependency_file_from_manifest(
+    parsed_args: &ParsedArguments,
+    cwd: &Path,
+    included_files: &[PathBuf],
+) -> Result<bool> {
+    if !cfg!(unix) {
+        return Ok(false);
+    }
+    let Some(dependency_output) = parsed_args.outputs.get("d") else {
+        return Ok(true);
+    };
+    let Some(target) = dependency_target(&parsed_args.dependency_args) else {
+        return Ok(false);
+    };
+    if std::iter::once(&parsed_args.input)
+        .chain(included_files)
+        .any(|path| !makefile_path_supported(path.as_os_str()))
+    {
+        return Ok(false);
+    }
+
+    let mut contents = Vec::new();
+    contents.extend_from_slice(&target);
+    contents.extend_from_slice(b":");
+    for path in std::iter::once(&parsed_args.input).chain(included_files) {
+        contents.extend_from_slice(b" \\\n  ");
+        append_makefile_escaped_path(&mut contents, path.as_os_str());
+    }
+    contents.push(b'\n');
+    fs::write(cwd.join(&dependency_output.path), contents)?;
+    Ok(true)
+}
+
+fn dependency_target(arguments: &[OsString]) -> Option<Vec<u8>> {
+    if !arguments.iter().any(|argument| argument == "-MD")
+        || arguments
+            .iter()
+            .any(|argument| argument == "-MMD" || argument == "-MP")
+    {
+        return None;
+    }
+
+    let mut targets = arguments
+        .windows(2)
+        .filter_map(|pair| match pair[0].to_str()? {
+            "-MT" if makefile_path_supported(&pair[1]) => Some(pair[1].as_encoded_bytes().to_vec()),
+            "-MQ" if makefile_path_supported(&pair[1]) => {
+                let mut escaped = Vec::new();
+                append_makefile_escaped_path(&mut escaped, &pair[1]);
+                Some(escaped)
+            }
+            _ => None,
+        });
+    let target = targets.next()?;
+    targets.next().is_none().then_some(target)
+}
+
+fn makefile_path_supported(path: &OsStr) -> bool {
+    !path
+        .as_encoded_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'\\' | b'\n' | b'\r' | b':'))
+}
+
+fn append_makefile_escaped_path(output: &mut Vec<u8>, path: &OsStr) {
+    for byte in path.as_encoded_bytes() {
+        match byte {
+            b' ' | b'\t' | b'#' => {
+                output.push(b'\\');
+                output.push(*byte);
+            }
+            b'$' => output.extend_from_slice(b"$$"),
+            _ => output.push(*byte),
+        }
     }
 }
 
@@ -1233,6 +1322,10 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         self.is_locally_preprocessed
     }
 
+    fn has_local_dependency_file(&self) -> bool {
+        self.has_local_dependency_file
+    }
+
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
         Box::new(
             self.parsed_args
@@ -1754,6 +1847,27 @@ mod test {
             b"/home/user1/project".to_vec(), // This should match (longest)
         ];
         assert_eq!(h1, hash_with_basedirs(preprocessed1, &multi_basedirs));
+    }
+
+    #[test]
+    fn test_dependency_target() {
+        assert_eq!(
+            dependency_target(&ovec!["-MD", "-MT", "output.o"]),
+            Some(b"output.o".to_vec())
+        );
+        assert_eq!(
+            dependency_target(&ovec!["-MD", "-MQ", "output file$.o"]),
+            Some(b"output\\ file$$.o".to_vec())
+        );
+        assert_eq!(dependency_target(&ovec!["-MMD", "-MT", "output.o"]), None);
+        assert_eq!(
+            dependency_target(&ovec!["-MD", "-MP", "-MT", "output.o"]),
+            None
+        );
+        assert_eq!(
+            dependency_target(&ovec!["-MD", "-MT", "one.o", "-MT", "two.o"]),
+            None
+        );
     }
 
     #[cfg(target_os = "windows")]
