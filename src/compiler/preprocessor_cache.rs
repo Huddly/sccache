@@ -172,18 +172,24 @@ impl PreprocessorCacheEntry {
         }
     }
 
-    /// Returns the digest of the first result whose expected included files
-    /// are already on disk and have not changed.
-    pub fn lookup_result_digest(
+    /// Returns the digest and included files of the first result whose expected
+    /// included files are already on disk and have not changed.
+    pub fn lookup_result(
         &mut self,
         config: PreprocessorCacheModeConfig,
         updated: &mut bool,
-    ) -> Option<String> {
+    ) -> Option<(String, Vec<PathBuf>)> {
         // Check newest result first since it's more likely to match.
         for (digest, includes) in self.results.iter_mut().rev() {
             let result_matches = Self::result_matches(digest, includes, config, updated);
             if result_matches {
-                return Some(digest.clone());
+                return Some((
+                    digest.clone(),
+                    includes
+                        .iter()
+                        .map(|include| PathBuf::from(&include.path))
+                        .collect(),
+                ));
             }
         }
         None
