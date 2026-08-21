@@ -1902,6 +1902,7 @@ where
 mod test {
     use super::*;
     use crate::cache::disk::DiskCache;
+    use crate::cache::multilevel::MultiLevelStorage;
     use crate::cache::{CacheMode, CacheRead};
     use crate::config::PreprocessorCacheModeConfig;
     use crate::mock_command::*;
@@ -2671,6 +2672,225 @@ LLVM version: 6.0",
         assert_eq!(exit_status(0), res.status);
         assert_eq!(COMPILER_STDOUT, res.stdout.as_slice());
         assert_eq!(COMPILER_STDERR, res.stderr.as_slice());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_direct_cache_cross_root_depfile_after_l1_backfill() {
+        drop(env_logger::try_init());
+        let creator = new_creator();
+        let f = TestFixture::new();
+        let gcc = f.mk_bin("gcc").unwrap();
+        let runtime = Runtime::new().unwrap();
+        let pool = runtime.handle().clone();
+        let root_a = f.tempdir.path().join("root-a");
+        let root_b = f.tempdir.path().join("root-b");
+        fs::create_dir_all(&root_a).unwrap();
+        fs::create_dir_all(&root_b).unwrap();
+        for root in [&root_a, &root_b] {
+            fs::write(
+                root.join("foo.c"),
+                "#include \"foo.h\"\nint foo(void) { return VALUE; }\n",
+            )
+            .unwrap();
+            fs::write(root.join("foo.h"), "#define VALUE 42\n").unwrap();
+        }
+
+        let basedirs = vec![
+            root_a.as_os_str().as_encoded_bytes().to_vec(),
+            root_b.as_os_str().as_encoded_bytes().to_vec(),
+        ];
+        let preprocessor_cache_mode = PreprocessorCacheModeConfig {
+            use_preprocessor_cache_mode: true,
+            ..Default::default()
+        };
+        let l1_dir = f.tempdir.path().join("l1-cache");
+
+        // Populate the slower cache from root A. Its cached dependency artifact
+        // deliberately contains producer-root paths.
+        let producer_storage: Arc<dyn Storage> = Arc::new(DiskCache::new(
+            &l1_dir,
+            u64::MAX,
+            &pool,
+            preprocessor_cache_mode,
+            CacheMode::ReadWrite,
+            basedirs.clone(),
+        ));
+        let producer_service =
+            server::SccacheService::mock_with_storage(producer_storage.clone(), pool.clone());
+        next_command(
+            &creator,
+            Ok(MockChild::new(exit_status(0), "compiler_id=gcc", "")),
+        );
+        let compiler = get_compiler_info(
+            creator.clone(),
+            &gcc,
+            f.tempdir.path(),
+            &[],
+            &[],
+            &pool,
+            None,
+        )
+        .wait()
+        .unwrap()
+        .0;
+        let arguments = ovec![
+            "-c", "foo.c", "-o", "foo.o", "-MD", "-MT", "foo.o", "-MF", "foo.d"
+        ];
+        let preprocessed_a = format!(
+            "# 0 \"{}/foo.c\"\n# 1 \"{}/foo.h\" 1\n42\n# 2 \"{}/foo.c\" 2\nint foo(void) {{ return 42; }}\n",
+            root_a.display(),
+            root_a.display(),
+            root_a.display()
+        );
+        let producer_depfile = format!(
+            "foo.o: {}/foo.c {}/foo.h\n",
+            root_a.display(),
+            root_a.display()
+        );
+        let root_a_for_preprocess = root_a.clone();
+        let producer_depfile_for_preprocess = producer_depfile.clone();
+        next_command_calls(&creator, move |_| {
+            fs::write(
+                root_a_for_preprocess.join("foo.d"),
+                &producer_depfile_for_preprocess,
+            )?;
+            Ok(MockChild::new(exit_status(0), &preprocessed_a, ""))
+        });
+        let root_a_for_compile = root_a.clone();
+        next_command_calls(&creator, move |_| {
+            fs::write(root_a_for_compile.join("foo.o"), b"object from root A")?;
+            fs::write(root_a_for_compile.join("foo.d"), &producer_depfile)?;
+            Ok(MockChild::new(exit_status(0), "", ""))
+        });
+        let mut producer_hasher = match compiler.parse_arguments(&arguments, &root_a, &[]) {
+            CompilerArguments::Ok(hasher) => hasher,
+            other => panic!("Bad result from parse_arguments: {other:?}"),
+        };
+        let (result, _) = runtime
+            .block_on(producer_hasher.get_cached_or_compile(
+                &producer_service,
+                None,
+                creator.clone(),
+                producer_storage.clone(),
+                arguments.clone(),
+                root_a.clone(),
+                vec![],
+                CacheControl::Default,
+                pool.clone(),
+            ))
+            .unwrap();
+        match result {
+            CompileResult::CacheMiss(MissType::Normal, DistType::NoDist, _, future) => {
+                future.wait().unwrap();
+            }
+            other => panic!("Unexpected compile result: {other:?}"),
+        }
+        drop(producer_service);
+        drop(producer_storage);
+
+        // Remote caches don't provide direct-mode manifests. Removing the
+        // producer manifest makes the first root-B request preprocess locally,
+        // hit L1, and backfill the foreign artifact into L0.
+        fs::remove_dir_all(l1_dir.join("preprocessor")).unwrap();
+        let l0: Arc<dyn Storage> = Arc::new(DiskCache::new(
+            f.tempdir.path().join("l0-cache"),
+            u64::MAX,
+            &pool,
+            preprocessor_cache_mode,
+            CacheMode::ReadWrite,
+            basedirs.clone(),
+        ));
+        let l1: Arc<dyn Storage> = Arc::new(DiskCache::new(
+            &l1_dir,
+            u64::MAX,
+            &pool,
+            preprocessor_cache_mode,
+            CacheMode::ReadWrite,
+            basedirs,
+        ));
+        let multilevel = Arc::new(MultiLevelStorage::new(vec![l0, l1]));
+        let storage: Arc<dyn Storage> = multilevel.clone();
+        let consumer_service =
+            server::SccacheService::mock_with_storage(storage.clone(), pool.clone());
+        let preprocessed_b = format!(
+            "# 0 \"{}/foo.c\"\n# 1 \"{}/foo.h\" 1\n42\n# 2 \"{}/foo.c\" 2\nint foo(void) {{ return 42; }}\n",
+            root_b.display(),
+            root_b.display(),
+            root_b.display()
+        );
+        let consumer_depfile = format!(
+            "foo.o: {}/foo.c {}/foo.h\n",
+            root_b.display(),
+            root_b.display()
+        );
+        let root_b_for_preprocess = root_b.clone();
+        next_command_calls(&creator, move |_| {
+            fs::write(root_b_for_preprocess.join("foo.d"), &consumer_depfile)?;
+            Ok(MockChild::new(exit_status(0), &preprocessed_b, ""))
+        });
+        let mut consumer_hasher = match compiler.parse_arguments(&arguments, &root_b, &[]) {
+            CompilerArguments::Ok(hasher) => hasher,
+            other => panic!("Bad result from parse_arguments: {other:?}"),
+        };
+        let (result, _) = runtime
+            .block_on(consumer_hasher.get_cached_or_compile(
+                &consumer_service,
+                None,
+                creator.clone(),
+                storage.clone(),
+                arguments.clone(),
+                root_b.clone(),
+                vec![],
+                CacheControl::Default,
+                pool.clone(),
+            ))
+            .unwrap();
+        assert!(matches!(result, CompileResult::CacheHit(_)));
+        let first_consumer_depfile = fs::read_to_string(root_b.join("foo.d")).unwrap();
+        assert!(first_consumer_depfile.contains(root_b.to_str().unwrap()));
+        assert!(!first_consumer_depfile.contains(root_a.to_str().unwrap()));
+
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if multilevel.stats().0[0].backfills_to == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("L1 cache hit was not backfilled to L0");
+        });
+
+        // The next request must be a direct-mode, warm-L0 hit. No mock command
+        // is queued, so any attempted preprocessing or compilation also fails
+        // the test.
+        fs::remove_file(root_b.join("foo.o")).unwrap();
+        fs::remove_file(root_b.join("foo.d")).unwrap();
+        let (result, _) = runtime
+            .block_on(consumer_hasher.get_cached_or_compile(
+                &consumer_service,
+                None,
+                creator,
+                storage,
+                arguments,
+                root_b.clone(),
+                vec![],
+                CacheControl::Default,
+                pool,
+            ))
+            .unwrap();
+        assert!(matches!(result, CompileResult::CacheHit(_)));
+        assert_eq!(
+            fs::read(root_b.join("foo.o")).unwrap(),
+            b"object from root A"
+        );
+        let warm_l0_depfile = fs::read_to_string(root_b.join("foo.d")).unwrap();
+        assert!(warm_l0_depfile.contains(root_b.to_str().unwrap()));
+        assert!(!warm_l0_depfile.contains(root_a.to_str().unwrap()));
+        assert_eq!(multilevel.stats().0[0].hits, 1);
     }
 
     #[test_case(true ; "with preprocessor cache")]
