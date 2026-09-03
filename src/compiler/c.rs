@@ -741,7 +741,7 @@ fn dependency_target(arguments: &[OsString]) -> Option<Vec<u8>> {
     if !arguments.iter().any(|argument| argument == "-MD")
         || arguments
             .iter()
-            .any(|argument| argument == "-MMD" || argument == "-MP")
+            .any(|argument| argument == "-MMD" || argument == "-MP" || argument == "-MV")
     {
         return None;
     }
@@ -1864,6 +1864,10 @@ mod test {
         assert_eq!(dependency_target(&ovec!["-MMD", "-MT", "output.o"]), None);
         assert_eq!(
             dependency_target(&ovec!["-MD", "-MP", "-MT", "output.o"]),
+            None
+        );
+        assert_eq!(
+            dependency_target(&ovec!["-MD", "-MV", "-MT", "output.o"]),
             None
         );
         assert_eq!(
