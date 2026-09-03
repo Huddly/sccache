@@ -195,6 +195,7 @@ counted_array!(pub static ARGS: [ArgInfo<gcc::ArgData>; _] = [
     take_arg!("-MF", PathBuf, CanBeSeparated, DepArgumentPath),
     take_arg!("-MQ", OsString, CanBeSeparated, DepTarget),
     take_arg!("-MT", OsString, CanBeSeparated, DepTarget),
+    flag!("-MV", NeedDepTarget),
     flag!("-Wno-unknown-cuda-version", PassThroughFlag),
     flag!("-Wno-unused-parameter", PassThroughFlag),
     take_arg!("-Xclang", OsString, Separated, XClang),
@@ -729,6 +730,17 @@ mod test {
                 assert_eq!(parsed.dependency_args, parsed_separated.dependency_args);
             }
         }
+    }
+
+    #[test]
+    fn test_parse_clang_mv_as_dependency_argument() {
+        let parsed = parses!("-c", "foo.c", "-MD", "-MV", "-MT", "foo.o");
+
+        assert_eq!(
+            parsed.dependency_args,
+            ovec!["-MD", "-MV", "-MT", "foo.o", "-MF", "foo.d"]
+        );
+        assert!(parsed.common_args.is_empty());
     }
 
     #[test]
