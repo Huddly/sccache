@@ -731,7 +731,9 @@ fn write_dependency_file_from_manifest(
         append_makefile_escaped_path(&mut contents, path.as_os_str());
     }
     contents.push(b'\n');
-    fs::write(cwd.join(&dependency_output.path), contents)?;
+    if fs::write(cwd.join(&dependency_output.path), contents).is_err() {
+        return Ok(false);
+    }
     Ok(true)
 }
 
@@ -1868,6 +1870,33 @@ mod test {
             dependency_target(&ovec!["-MD", "-MT", "one.o", "-MT", "two.o"]),
             None
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_dependency_file_write_failure_falls_back() {
+        let cwd = tempfile::tempdir().unwrap();
+        let arguments = ovec![
+            "-c",
+            "input.c",
+            "-MD",
+            "-MT",
+            "output.o",
+            "-MF",
+            "missing/output.d"
+        ];
+        let parsed_args = match crate::compiler::gcc::parse_arguments(
+            &arguments,
+            cwd.path(),
+            &crate::compiler::gcc::ARGS[..],
+            false,
+            CCompilerKind::Gcc,
+        ) {
+            CompilerArguments::Ok(args) => args,
+            other => panic!("Bad result from parse_arguments: {other:?}"),
+        };
+
+        assert!(!write_dependency_file_from_manifest(&parsed_args, cwd.path(), &[]).unwrap());
     }
 
     #[cfg(target_os = "windows")]
