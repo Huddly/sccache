@@ -135,7 +135,7 @@ impl ParsedArguments {
 struct CCompilation<I: CCompilerImpl> {
     parsed_args: ParsedArguments,
     is_locally_preprocessed: bool,
-    has_local_dependency_file: bool,
+    skip_dependency_file_restore: bool,
     #[cfg(feature = "dist-client")]
     preprocessed_input: Vec<u8>,
     executable: PathBuf,
@@ -492,13 +492,13 @@ where
                 if !update_failed {
                     if let Some((key, included_files)) = hit {
                         debug!("Preprocessor cache hit: {preprocessor_key}");
-                        let has_local_dependency_file = !storage.basedirs().is_empty()
+                        let skip_dependency_file_restore = !storage.basedirs().is_empty()
                             && write_dependency_file_from_manifest(
                                 &self.parsed_args,
                                 &cwd,
                                 &included_files,
                             )?;
-                        if storage.basedirs().is_empty() || has_local_dependency_file {
+                        if storage.basedirs().is_empty() || skip_dependency_file_restore {
                             // A compiler binary may be a symlink to another and
                             // so has the same digest, but that means
                             // the toolchain will not contain the correct path
@@ -514,7 +514,7 @@ where
                                 compilation: Box::new(CCompilation {
                                     parsed_args: self.parsed_args.clone(),
                                     is_locally_preprocessed: false,
-                                    has_local_dependency_file,
+                                    skip_dependency_file_restore,
                                     #[cfg(feature = "dist-client")]
                                     preprocessed_input: PREPROCESSING_SKIPPED_COMPILE_POISON
                                         .to_vec(),
@@ -673,7 +673,7 @@ where
             compilation: Box::new(CCompilation {
                 parsed_args: self.parsed_args.clone(),
                 is_locally_preprocessed: true,
-                has_local_dependency_file: true,
+                skip_dependency_file_restore: true,
                 #[cfg(feature = "dist-client")]
                 preprocessed_input: preprocessor_output,
                 executable: self.executable.clone(),
@@ -1324,8 +1324,8 @@ impl<T: CommandCreatorSync, I: CCompilerImpl> Compilation<T> for CCompilation<I>
         self.is_locally_preprocessed
     }
 
-    fn has_local_dependency_file(&self) -> bool {
-        self.has_local_dependency_file
+    fn skip_dependency_file_restore(&self) -> bool {
+        self.skip_dependency_file_restore
     }
 
     fn outputs<'a>(&'a self) -> Box<dyn Iterator<Item = FileObjectSource> + 'a> {
