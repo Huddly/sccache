@@ -616,7 +616,7 @@ where
                     stderr: entry.get_stderr(),
                 };
 
-                let filtered_outputs = if compilation.has_local_dependency_file() {
+                let filtered_outputs = if compilation.skip_dependency_file_restore() {
                     // In this mode, cache entries are exclusively distinguished by their preprocessed
                     // source contents. But two files may differ in their names and / or the names of
                     // included files while still producing the same preprocessed output, so they get the
@@ -1112,7 +1112,7 @@ where
         true
     }
 
-    fn has_local_dependency_file(&self) -> bool {
+    fn skip_dependency_file_restore(&self) -> bool {
         self.is_locally_preprocessed()
     }
 
