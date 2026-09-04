@@ -704,7 +704,8 @@ where
         stderr,
     )?;
     // Ship accumulated stats back to the daemon (best-effort; don't fail the build on error).
-    let delta: ServerStats = runtime.block_on(service.take_stats());
+    let mut delta: ServerStats = runtime.block_on(service.take_stats());
+    delta.compile_requests += 1;
     if let Ok(mut conn) = conn_arc.lock() {
         let _ = conn.request(Request::RecordStats(Box::new(delta)));
     }
