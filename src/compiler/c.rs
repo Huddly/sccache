@@ -471,8 +471,12 @@ where
                 seekable.read_to_end(&mut buf)?;
                 let mut preprocessor_cache_entry = PreprocessorCacheEntry::read(&buf)?;
                 let mut updated = false;
-                let hit = preprocessor_cache_entry
-                    .lookup_result(preprocessor_cache_mode_config, &mut updated);
+                let hit = preprocessor_cache_entry.lookup_result(
+                    preprocessor_cache_mode_config,
+                    &mut updated,
+                    &absolute_input_path,
+                    storage.basedirs(),
+                );
 
                 let mut update_failed = false;
                 if updated {
@@ -650,7 +654,13 @@ where
                 .map(|(path, digest)| (digest, path))
                 .collect();
             files.sort_unstable_by(|a, b| a.1.cmp(&b.1));
-            preprocessor_cache_entry.add_result(start_of_compilation, &key, files);
+            preprocessor_cache_entry.add_result(
+                start_of_compilation,
+                &key,
+                files,
+                &absolute_input_path,
+                storage.basedirs(),
+            );
 
             if let Err(e) = storage
                 .put_preprocessor_cache_entry(&preprocessor_key, preprocessor_cache_entry)

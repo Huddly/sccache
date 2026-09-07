@@ -34,14 +34,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     config::PreprocessorCacheModeConfig,
-    util::{Digest, HashToDigest, MetadataCtimeExt, Timestamp, encode_path, strip_basedirs},
+    util::{
+        Digest, HashToDigest, MetadataCtimeExt, Timestamp, decode_path, encode_path, strip_basedirs,
+    },
 };
 
 use super::Language;
 
 /// The current format is 1 header byte for the version + bincode encoding
 /// of the [`PreprocessorCacheEntry`] struct.
-const FORMAT_VERSION: u8 = 0;
+const FORMAT_VERSION: u8 = 1;
 const MAX_PREPROCESSOR_CACHE_ENTRIES: usize = 100;
 const MAX_PREPROCESSOR_CACHE_FILE_INFO_ENTRIES: usize = 10000;
 
@@ -94,6 +96,8 @@ impl PreprocessorCacheEntry {
         compilation_time_start: SystemTime,
         result_key: &str,
         included_files: impl IntoIterator<Item = (String, PathBuf)>,
+        input_file: &Path,
+        basedirs: &[Vec<u8>],
     ) {
         if self.results.len() > MAX_PREPROCESSOR_CACHE_ENTRIES {
             // Normally, there shouldn't be many result entries in the
@@ -117,6 +121,7 @@ impl PreprocessorCacheEntry {
             self.results.clear();
             self.number_of_entries = 0;
         }
+        let basedir = input_basedir(input_file, basedirs);
         let includes: Result<Vec<_>, std::io::Error> = included_files
             .into_iter()
             .map(|(digest, path)| {
@@ -124,12 +129,21 @@ impl PreprocessorCacheEntry {
                 let mtime: Option<Timestamp> = meta.modified().ok().map(|t| t.into());
                 let ctime = meta.ctime_or_creation().ok();
 
-                let should_cache_time = match (mtime, ctime) {
-                    (Some(mtime), Some(ctime)) => {
-                        Timestamp::from(compilation_time_start) > mtime.max(ctime)
-                    }
-                    _ => false,
-                };
+                let path = basedir
+                    .as_deref()
+                    .and_then(|basedir| path.strip_prefix(basedir).ok())
+                    .map(Path::to_path_buf)
+                    .unwrap_or(path);
+
+                // Metadata from one checkout cannot validate a relative path
+                // resolved in another checkout.
+                let should_cache_time = path.is_absolute()
+                    && match (mtime, ctime) {
+                        (Some(mtime), Some(ctime)) => {
+                            Timestamp::from(compilation_time_start) > mtime.max(ctime)
+                        }
+                        _ => false,
+                    };
                 Ok(IncludeEntry {
                     path: path.into_os_string(),
                     digest,
@@ -178,18 +192,23 @@ impl PreprocessorCacheEntry {
         &mut self,
         config: PreprocessorCacheModeConfig,
         updated: &mut bool,
+        input_file: &Path,
+        basedirs: &[Vec<u8>],
     ) -> Option<(String, Vec<PathBuf>)> {
+        let basedir = input_basedir(input_file, basedirs);
         // Check newest result first since it's more likely to match.
         for (digest, includes) in self.results.iter_mut().rev() {
-            let result_matches = Self::result_matches(digest, includes, config, updated);
+            let included_files: Option<Vec<_>> = includes
+                .iter()
+                .map(|include| resolve_include_path(include, basedir.as_deref()))
+                .collect();
+            let Some(included_files) = included_files else {
+                continue;
+            };
+            let result_matches =
+                Self::result_matches(digest, includes, &included_files, config, updated);
             if result_matches {
-                return Some((
-                    digest.clone(),
-                    includes
-                        .iter()
-                        .map(|include| PathBuf::from(&include.path))
-                        .collect(),
-                ));
+                return Some((digest.clone(), included_files));
             }
         }
         None
@@ -199,11 +218,11 @@ impl PreprocessorCacheEntry {
     fn result_matches(
         digest: &str,
         includes: &mut [IncludeEntry],
+        included_files: &[PathBuf],
         config: PreprocessorCacheModeConfig,
         updated: &mut bool,
     ) -> bool {
-        for include in includes {
-            let path = Path::new(include.path.as_os_str());
+        for (include, path) in includes.iter_mut().zip(included_files) {
             let meta = match std::fs::symlink_metadata(path) {
                 Ok(meta) => {
                     if meta.len() != include.file_size {
@@ -357,6 +376,47 @@ impl PreprocessorCacheEntry {
     }
 }
 
+fn input_basedir(input_file: &Path, basedirs: &[Vec<u8>]) -> Option<PathBuf> {
+    let mut input = Vec::new();
+    encode_path(&mut input, input_file).ok()?;
+
+    #[cfg(not(target_os = "windows"))]
+    let normalized_input = input.as_slice();
+    #[cfg(target_os = "windows")]
+    let normalized_input = &crate::util::normalize_win_path(&input);
+
+    let relative_input_start = basedirs
+        .iter()
+        .filter_map(|basedir| {
+            if basedir.ends_with(b"/") && normalized_input.starts_with(basedir) {
+                Some((basedir.len(), basedir.len()))
+            } else if normalized_input.starts_with(basedir)
+                && normalized_input.get(basedir.len()) == Some(&b'/')
+            {
+                Some((basedir.len(), basedir.len() + 1))
+            } else {
+                None
+            }
+        })
+        .max_by_key(|(basedir_len, _)| *basedir_len)
+        .map(|(_, relative_input_start)| relative_input_start)?;
+    let relative_input = decode_path(&input[relative_input_start..]).ok()?;
+    let mut basedir = input_file.to_path_buf();
+    for _ in relative_input.components() {
+        basedir.pop();
+    }
+    Some(basedir)
+}
+
+fn resolve_include_path(include: &IncludeEntry, basedir: Option<&Path>) -> Option<PathBuf> {
+    let path = Path::new(&include.path);
+    if path.is_absolute() {
+        Some(path.to_path_buf())
+    } else {
+        basedir.map(|basedir| basedir.join(path))
+    }
+}
+
 /// Environment variables that are factored into the preprocessor cache entry cached key.
 static CACHED_ENV_VARS: LazyLock<HashSet<&'static OsStr>> = LazyLock::new(|| {
     [
@@ -446,7 +506,7 @@ pub fn preprocessor_cache_entry_hash_key(
 /// Corresponds to a cached include file used in the pre-processor stage
 #[derive(Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
 pub struct IncludeEntry {
-    /// Its absolute path
+    /// Its path, relative to the input file's basedir when possible.
     path: OsString,
     /// The hash of its contents
     digest: String,
@@ -497,6 +557,77 @@ mod test {
     use crate::util::{HASH_BUFFER_SIZE, MAX_TIME_MACRO_HAYSTACK_LEN};
 
     use super::*;
+
+    fn encoded_basedir(path: &Path) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        encode_path(&mut encoded, path).unwrap();
+        #[cfg(target_os = "windows")]
+        let mut encoded = crate::util::normalize_win_path(&encoded);
+        if !encoded.ends_with(b"/") {
+            encoded.push(b'/');
+        }
+        encoded
+    }
+
+    #[test]
+    fn test_include_paths_follow_current_basedir() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let checkout_a = tempdir.path().join("a");
+        let checkout_b = tempdir.path().join("b");
+        std::fs::create_dir_all(&checkout_a).unwrap();
+        std::fs::create_dir_all(&checkout_b).unwrap();
+
+        let source_a = checkout_a.join("input.c");
+        let source_b = checkout_b.join("input.c");
+        let header_a = checkout_a.join("ctrl.hpp");
+        let header_b = checkout_b.join("ctrl.hpp");
+        std::fs::write(&source_a, b"#include \"ctrl.hpp\"\n").unwrap();
+        std::fs::write(&source_b, b"#include \"ctrl.hpp\"\n").unwrap();
+        std::fs::write(&header_a, b"old").unwrap();
+        std::fs::write(&header_b, b"old").unwrap();
+
+        let header_digest = Digest::reader_sync(std::fs::File::open(&header_a).unwrap()).unwrap();
+        let basedirs_a = vec![
+            encoded_basedir(tempdir.path()),
+            encoded_basedir(&checkout_a),
+        ];
+        let basedirs_b = vec![
+            encoded_basedir(tempdir.path()),
+            encoded_basedir(&checkout_b),
+        ];
+
+        let mut entry = PreprocessorCacheEntry::new();
+        entry.add_result(
+            SystemTime::now(),
+            "result",
+            [(header_digest, header_a.clone())],
+            &source_a,
+            &basedirs_a,
+        );
+
+        let mut serialized = Vec::new();
+        entry.serialize_to(&mut serialized).unwrap();
+        let mut entry = PreprocessorCacheEntry::read(&serialized).unwrap();
+
+        let stored_include = &entry.results["result"][0];
+        assert_eq!(stored_include.path, OsString::from("ctrl.hpp"));
+        assert_eq!(stored_include.mtime, None);
+        assert_eq!(stored_include.ctime, None);
+
+        let mut config = PreprocessorCacheModeConfig::activated();
+        config.file_stat_matches = true;
+        let hit = entry
+            .lookup_result(config, &mut false, &source_b, &basedirs_b)
+            .unwrap();
+        assert_eq!(hit, ("result".to_owned(), vec![header_b.clone()]));
+
+        std::fs::write(&header_b, b"new").unwrap();
+        assert!(
+            entry
+                .lookup_result(config, &mut false, &source_b, &basedirs_b)
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_find_time_macros_empty_file() {
